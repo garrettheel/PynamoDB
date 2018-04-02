@@ -35,6 +35,9 @@ from pynamodb.constants import (
     STREAM_ENABLED, EQ, NE, BINARY_SET, STRING_SET, NUMBER_SET)
 
 
+import asyncio
+
+
 log = logging.getLogger(__name__)
 log.addHandler(NullHandler())
 
@@ -106,7 +109,7 @@ class BatchWrite(ModelContextManager):
         """
         return self.commit()
 
-    def commit(self):
+    async def commit(self):
         """
         Writes all of the changes that are pending
         """
@@ -122,7 +125,7 @@ class BatchWrite(ModelContextManager):
         self.pending_operations = []
         if not len(put_items) and not len(delete_items):
             return
-        data = self.model._get_connection().batch_write_item(
+        data = await self.model._get_connection().batch_write_item(
             put_items=put_items,
             delete_items=delete_items
         )
@@ -138,7 +141,7 @@ class BatchWrite(ModelContextManager):
                 elif DELETE_REQUEST in item:
                     delete_items.append(item.get(DELETE_REQUEST).get(KEY))
             log.info("Resending %s unprocessed keys for batch operation", len(unprocessed_items))
-            data = self.model._get_connection().batch_write_item(
+            data = await self.model._get_connection().batch_write_item(
                 put_items=put_items,
                 delete_items=delete_items
             )
@@ -225,12 +228,14 @@ class Model(AttributeContainer):
     _index_classes = None
     DoesNotExist = DoesNotExist
 
-    def __init__(self, hash_key=None, range_key=None, **attributes):
+    async def __init__(self, hash_key=None, range_key=None, **attributes):
         """
         :param hash_key: Required. The hash key for this object.
         :param range_key: Only required if the table has a range key attribute.
         :param attrs: A dictionary of attributes to set on this object.
         """
+        await self._set_meta_table()
+
         if hash_key is not None:
             attributes[self._dynamo_to_python_attr(self._get_meta_data().hash_keyname)] = hash_key
         if range_key is not None:
@@ -241,6 +246,16 @@ class Model(AttributeContainer):
                 )
             attributes[self._dynamo_to_python_attr(range_keyname)] = range_key
         super(Model, self).__init__(**attributes)
+
+    async def __new__(cls, *args, **kwargs):
+        instance = object.__new__(cls)
+        await instance.__init__(*args, **kwargs)
+        return instance
+
+    @classmethod
+    async def _set_meta_table(cls):
+        if cls._meta_table is None:
+            cls._meta_table = MetaTable((await cls._get_connection().describe_table()))
 
     @classmethod
     def has_map_or_list_attributes(cls):
@@ -255,7 +270,7 @@ class Model(AttributeContainer):
             raise NotImplementedError('Map and List attribute do not support conditional_operator yet')
 
     @classmethod
-    def batch_get(cls, items, consistent_read=None, attributes_to_get=None):
+    async def batch_get(cls, items, consistent_read=None, attributes_to_get=None):
         """
         BatchGetItem for this model
 
@@ -275,7 +290,7 @@ class Model(AttributeContainer):
                         attributes_to_get=attributes_to_get
                     )
                     for batch_item in page:
-                        yield cls.from_raw_data(batch_item)
+                        yield (await cls.from_raw_data(batch_item))
                     if unprocessed_keys:
                         keys_to_get = unprocessed_keys
                     else:
@@ -300,7 +315,7 @@ class Model(AttributeContainer):
                 attributes_to_get=attributes_to_get
             )
             for batch_item in page:
-                yield cls.from_raw_data(batch_item)
+                yield (await cls.from_raw_data(batch_item))
             if unprocessed_keys:
                 keys_to_get = unprocessed_keys
             else:
@@ -328,7 +343,7 @@ class Model(AttributeContainer):
                 msg = "{0}<{1}>".format(self.Meta.table_name, serialized.get(HASH))
             return six.u(msg)
 
-    def delete(self, condition=None, conditional_operator=None, **expected_values):
+    async def delete(self, condition=None, conditional_operator=None, **expected_values):
         """
         Deletes this object from dynamodb
         """
@@ -338,9 +353,9 @@ class Model(AttributeContainer):
             kwargs.update(expected=self._build_expected_values(expected_values, DELETE_FILTER_OPERATOR_MAP))
         kwargs.update(conditional_operator=conditional_operator)
         kwargs.update(condition=condition)
-        return self._get_connection().delete_item(*args, **kwargs)
+        return await self._get_connection().delete_item(*args, **kwargs)
 
-    def update_item(self, attribute, value=None, action=None, condition=None, conditional_operator=None, **expected_values):
+    async def update_item(self, attribute, value=None, action=None, condition=None, conditional_operator=None, **expected_values):
         """
         Updates an item using the UpdateItem operation.
 
@@ -380,7 +395,7 @@ class Model(AttributeContainer):
         kwargs[pythonic(RETURN_VALUES)] = ALL_NEW
         kwargs.update(conditional_operator=conditional_operator)
         kwargs.update(condition=condition)
-        data = self._get_connection().update_item(
+        data = await self._get_connection().update_item(
             *args,
             **kwargs
         )
@@ -392,7 +407,7 @@ class Model(AttributeContainer):
                 setattr(self, attr_name, attr.deserialize(attr.get_value(value)))
         return data
 
-    def update(self, attributes=None, actions=None, condition=None, conditional_operator=None, **expected_values):
+    async def update(self, attributes=None, actions=None, condition=None, conditional_operator=None, **expected_values):
         """
         Updates an item using the UpdateItem operation.
 
@@ -436,7 +451,7 @@ class Model(AttributeContainer):
 
         kwargs.update(condition=condition)
         kwargs.update(actions=actions)
-        data = self._get_connection().update_item(*args, **kwargs)
+        data = await self._get_connection().update_item(*args, **kwargs)
         for name, value in data[ATTRIBUTES].items():
             attr_name = self._dynamo_to_python_attr(name)
             attr = self._get_attributes().get(attr_name)
@@ -444,7 +459,7 @@ class Model(AttributeContainer):
                 setattr(self, attr_name, attr.deserialize(attr.get_value(value)))
         return data
 
-    def save(self, condition=None, conditional_operator=None, **expected_values):
+    async def save(self, condition=None, conditional_operator=None, **expected_values):
         """
         Save this object to dynamodb
         """
@@ -454,9 +469,9 @@ class Model(AttributeContainer):
             kwargs.update(expected=self._build_expected_values(expected_values, PUT_FILTER_OPERATOR_MAP))
         kwargs.update(conditional_operator=conditional_operator)
         kwargs.update(condition=condition)
-        return self._get_connection().put_item(*args, **kwargs)
+        return await self._get_connection().put_item(*args, **kwargs)
 
-    def refresh(self, consistent_read=False):
+    async def refresh(self, consistent_read=False):
         """
         Retrieves this object's data from dynamodb and syncs this local object
 
@@ -464,14 +479,14 @@ class Model(AttributeContainer):
         """
         args, kwargs = self._get_save_args(attributes=False)
         kwargs.setdefault('consistent_read', consistent_read)
-        attrs = self._get_connection().get_item(*args, **kwargs)
+        attrs = await self._get_connection().get_item(*args, **kwargs)
         item_data = attrs.get(ITEM, None)
         if item_data is None:
             raise self.DoesNotExist("This item does not exist in the table.")
         self._deserialize(item_data)
 
     @classmethod
-    def get(cls,
+    async def get(cls,
             hash_key,
             range_key=None,
             consistent_read=False,
@@ -482,8 +497,10 @@ class Model(AttributeContainer):
         :param hash_key: The hash key of the desired item
         :param range_key: The range key of the desired item, only used when appropriate.
         """
+        await cls._set_meta_table()
+
         hash_key, range_key = cls._serialize_keys(hash_key, range_key)
-        data = cls._get_connection().get_item(
+        data = await cls._get_connection().get_item(
             hash_key,
             range_key=range_key,
             consistent_read=consistent_read,
@@ -492,11 +509,11 @@ class Model(AttributeContainer):
         if data:
             item_data = data.get(ITEM)
             if item_data:
-                return cls.from_raw_data(item_data)
+                return await cls.from_raw_data(item_data)
         raise cls.DoesNotExist()
 
     @classmethod
-    def from_raw_data(cls, data):
+    async def from_raw_data(cls, data):
         """
         Returns an instance of this class
         from the raw data
@@ -526,10 +543,10 @@ class Model(AttributeContainer):
             attr = cls._get_attributes().get(attr_name, None)
             if attr:
                 kwargs[attr_name] = attr.deserialize(attr.get_value(value))
-        return cls(*args, **kwargs)
+        return await cls(*args, **kwargs)
 
     @classmethod
-    def count(cls,
+    async def count(cls,
               hash_key=None,
               range_key_condition=None,
               filter_condition=None,
@@ -598,7 +615,7 @@ class Model(AttributeContainer):
         return result_iterator.total_count
 
     @classmethod
-    def query(cls,
+    async def query(cls,
               hash_key,
               range_key_condition=None,
               filter_condition=None,
@@ -630,6 +647,7 @@ class Model(AttributeContainer):
         """
         cls._conditional_operator_check(conditional_operator)
         cls._get_indexes()
+        await cls._set_meta_table()
         if index_name:
             hash_key = cls._index_classes[index_name]._hash_key_attribute().serialize(hash_key)
             key_attribute_classes = cls._index_classes[index_name]._get_attributes()
@@ -678,7 +696,7 @@ class Model(AttributeContainer):
         )
 
     @classmethod
-    def rate_limited_scan(cls,
+    async def rate_limited_scan(cls,
             filter_condition=None,
             attributes_to_get=None,
             segment=None,
@@ -730,7 +748,7 @@ class Model(AttributeContainer):
         )
         key_filter.update(scan_filter)
 
-        scan_result = cls._get_connection().rate_limited_scan(
+        scan_result = await cls._get_connection().rate_limited_scan(
             filter_condition=filter_condition,
             attributes_to_get=attributes_to_get,
             page_size=page_size,
@@ -750,10 +768,10 @@ class Model(AttributeContainer):
         )
 
         for item in scan_result:
-            yield cls.from_raw_data(item)
+            yield (await cls.from_raw_data(item))
 
     @classmethod
-    def scan(cls,
+    async def scan(cls,
              filter_condition=None,
              segment=None,
              total_segments=None,
@@ -811,32 +829,32 @@ class Model(AttributeContainer):
         )
 
     @classmethod
-    def exists(cls):
+    async def exists(cls):
         """
         Returns True if this table exists, False otherwise
         """
         try:
-            cls._get_connection().describe_table()
+            await cls._get_connection().describe_table()
             return True
         except TableDoesNotExist:
             return False
 
     @classmethod
-    def delete_table(cls):
+    async def delete_table(cls):
         """
         Delete the table for this model
         """
-        return cls._get_connection().delete_table()
+        return await cls._get_connection().delete_table()
 
     @classmethod
-    def describe_table(cls):
+    async def describe_table(cls):
         """
         Returns the result of a DescribeTable operation on this model's table
         """
-        return cls._get_connection().describe_table()
+        return await cls._get_connection().describe_table()
 
     @classmethod
-    def create_table(cls, wait=False, read_capacity_units=None, write_capacity_units=None):
+    async def create_table(cls, wait=False, read_capacity_units=None, write_capacity_units=None):
         """
         Create the table for this model
 
@@ -869,12 +887,13 @@ class Model(AttributeContainer):
                 if attr_name not in attr_keys:
                     schema[pythonic(ATTR_DEFINITIONS)].append(attr)
                     attr_keys.append(attr_name)
-            cls._get_connection().create_table(
+            await cls._get_connection().create_table(
                 **schema
             )
+
         if wait:
             while True:
-                status = cls._get_connection().describe_table()
+                status = await cls._get_connection().describe_table()
                 if status:
                     data = status.get(TABLE_STATUS)
                     if data == ACTIVE:
@@ -1230,7 +1249,7 @@ class Model(AttributeContainer):
         return attrs
 
     @classmethod
-    def _batch_get_page(cls, keys_to_get, consistent_read, attributes_to_get):
+    async def _batch_get_page(cls, keys_to_get, consistent_read, attributes_to_get):
         """
         Returns a single page from BatchGetItem
         Also returns any unprocessed items
@@ -1240,7 +1259,7 @@ class Model(AttributeContainer):
         :param attributes_to_get: A list of attributes to return
         """
         log.debug("Fetching a BatchGetItem page")
-        data = cls._get_connection().batch_get_item(
+        data = await cls._get_connection().batch_get_item(
             keys_to_get, consistent_read=consistent_read, attributes_to_get=attributes_to_get
         )
         item_data = data.get(RESPONSES).get(cls.Meta.table_name)
@@ -1252,8 +1271,8 @@ class Model(AttributeContainer):
         """
         A helper object that contains meta data about this table
         """
-        if cls._meta_table is None:
-            cls._meta_table = MetaTable(cls._get_connection().describe_table())
+        #if cls._meta_table is None:
+        #    cls._meta_table = MetaTable((await cls._get_connection().describe_table()))
         return cls._meta_table
 
     @classmethod

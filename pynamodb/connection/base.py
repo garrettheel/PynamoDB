@@ -52,6 +52,16 @@ from pynamodb.settings import get_settings_value
 from pynamodb.signals import pre_dynamodb_send, post_dynamodb_send
 from pynamodb.types import HASH, RANGE
 
+from pynamodb.connection.asyncio import asyncio_enabled
+if asyncio_enabled:
+    import asyncio
+    import aiohttp
+    import aiobotocore
+    from aiobotocore.endpoint import text_
+    from multidict import MultiDict
+
+
+
 BOTOCORE_EXCEPTIONS = (BotoCoreError, ClientError)
 
 log = logging.getLogger(__name__)
@@ -217,6 +227,7 @@ class MetaTable(object):
             }
 
 
+
 class Connection(object):
     """
     A higher level abstraction over botocore
@@ -229,6 +240,10 @@ class Connection(object):
         self._local = local()
         self._requests_session = None
         self._client = None
+
+        self._async_client = None
+        self._async_session = None
+
         if region:
             self.region = region
         else:
@@ -295,31 +310,6 @@ class Connection(object):
 
         return self.requests_session.prepare_request(raw_request_with_params)
 
-    def dispatch(self, operation_name, operation_kwargs):
-        """
-        Dispatches `operation_name` with arguments `operation_kwargs`
-
-        Raises TableDoesNotExist if the specified table does not exist
-        """
-        if operation_name not in [DESCRIBE_TABLE, LIST_TABLES, UPDATE_TABLE, DELETE_TABLE, CREATE_TABLE]:
-            if RETURN_CONSUMED_CAPACITY not in operation_kwargs:
-                operation_kwargs.update(self.get_consumed_capacity_map(TOTAL))
-        self._log_debug(operation_name, operation_kwargs)
-
-        table_name = operation_kwargs.get(TABLE_NAME)
-        req_uuid = uuid.uuid4()
-
-        self.send_pre_boto_callback(operation_name, req_uuid, table_name)
-        data = self._make_api_call(operation_name, operation_kwargs)
-        self.send_post_boto_callback(operation_name, req_uuid, table_name)
-
-        if data and CONSUMED_CAPACITY in data:
-            capacity = data.get(CONSUMED_CAPACITY)
-            if isinstance(capacity, dict) and CAPACITY_UNITS in capacity:
-                capacity = capacity.get(CAPACITY_UNITS)
-            log.debug("%s %s consumed %s units",  data.get(TABLE_NAME, ''), operation_name, capacity)
-        return data
-
     def send_post_boto_callback(self, operation_name, req_uuid, table_name):
         try:
             post_dynamodb_send.send(self, operation_name=operation_name, table_name=table_name, req_uuid=req_uuid)
@@ -331,94 +321,6 @@ class Connection(object):
             pre_dynamodb_send.send(self, operation_name=operation_name, table_name=table_name, req_uuid=req_uuid)
         except Exception as e:
             log.exception("pre_boto callback threw an exception.")
-
-    def _make_api_call(self, operation_name, operation_kwargs):
-        """
-        This private method is here for two reasons:
-        1. It's faster to avoid using botocore's response parsing
-        2. It provides a place to monkey patch requests for unit testing
-        """
-        operation_model = self.client._service_model.operation_model(operation_name)
-        request_dict = self.client._convert_to_request_dict(
-            operation_kwargs,
-            operation_model
-        )
-        prepared_request = self._create_prepared_request(request_dict, operation_model)
-
-        for i in range(0, self._max_retry_attempts_exception + 1):
-            attempt_number = i + 1
-            is_last_attempt_for_exceptions = i == self._max_retry_attempts_exception
-
-            response = None
-            try:
-                response = self.requests_session.send(
-                    prepared_request,
-                    timeout=self._request_timeout_seconds,
-                    proxies=self.client._endpoint.proxies,
-                )
-                data = response.json()
-            except (requests.RequestException, ValueError) as e:
-                if is_last_attempt_for_exceptions:
-                    log.debug('Reached the maximum number of retry attempts: %s', attempt_number)
-                    if response:
-                        e.args += (str(response.content),)
-                    raise
-                else:
-                    # No backoff for fast-fail exceptions that likely failed at the frontend
-                    log.debug(
-                        'Retry needed for (%s) after attempt %s, retryable %s caught: %s',
-                        operation_name,
-                        attempt_number,
-                        e.__class__.__name__,
-                        e
-                    )
-                    continue
-
-            if response.status_code >= 300:
-                # Extract error code from __type
-                code = data.get('__type', '')
-                if '#' in code:
-                    code = code.rsplit('#', 1)[1]
-                botocore_expected_format = {'Error': {'Message': data.get('message', ''), 'Code': code}}
-                verbose_properties = {
-                    'request_id': response.headers.get('x-amzn-RequestId')
-                }
-
-                if 'RequestItems' in operation_kwargs:
-                    # Batch operations can hit multiple tables, report them comma separated
-                    verbose_properties['table_name'] = ','.join(operation_kwargs['RequestItems'])
-                else:
-                    verbose_properties['table_name'] = operation_kwargs.get('TableName')
-
-                try:
-                    raise VerboseClientError(botocore_expected_format, operation_name, verbose_properties)
-                except VerboseClientError as e:
-                    if is_last_attempt_for_exceptions:
-                        log.debug('Reached the maximum number of retry attempts: %s', attempt_number)
-                        raise
-                    elif response.status_code < 500 and code != 'ProvisionedThroughputExceededException':
-                        # We don't retry on a ConditionalCheckFailedException or other 4xx (except for
-                        # throughput related errors) because we assume they will fail in perpetuity.
-                        # Retrying when there is already contention could cause other problems
-                        # in part due to unnecessary consumption of throughput.
-                        raise
-                    else:
-                        # We use fully-jittered exponentially-backed-off retries:
-                        #  https://www.awsarchitectureblog.com/2015/03/backoff.html
-                        sleep_time_ms = random.randint(0, self._base_backoff_ms * (2 ** i))
-                        log.debug(
-                            'Retry with backoff needed for (%s) after attempt %s,'
-                            'sleeping for %s milliseconds, retryable %s caught: %s',
-                            operation_name,
-                            attempt_number,
-                            sleep_time_ms,
-                            e.__class__.__name__,
-                            e
-                        )
-                        time.sleep(sleep_time_ms / 1000.0)
-                        continue
-
-            return self._handle_binary_attributes(data)
 
     @staticmethod
     def _handle_binary_attributes(data):
@@ -487,7 +389,7 @@ class Connection(object):
             self._client = self.session.create_client(SERVICE_NAME, self.region, endpoint_url=self.host)
         return self._client
 
-    def get_meta_table(self, table_name, refresh=False):
+    async def get_meta_table(self, table_name, refresh=False):
         """
         Returns a MetaTable
         """
@@ -496,7 +398,7 @@ class Connection(object):
                 TABLE_NAME: table_name
             }
             try:
-                data = self.dispatch(DESCRIBE_TABLE, operation_kwargs)
+                data = await self.dispatch(DESCRIBE_TABLE, operation_kwargs)
                 self._tables[table_name] = MetaTable(data.get(TABLE_KEY))
             except BotoCoreError as e:
                 raise TableError("Unable to describe table: {0}".format(e), e)
@@ -507,7 +409,7 @@ class Connection(object):
                     raise
         return self._tables[table_name]
 
-    def create_table(self,
+    async def create_table(self,
                      table_name,
                      attribute_definitions=None,
                      key_schema=None,
@@ -574,12 +476,12 @@ class Connection(object):
             }
 
         try:
-            data = self.dispatch(CREATE_TABLE, operation_kwargs)
+            data = await self.dispatch(CREATE_TABLE, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise TableError("Failed to create table: {0}".format(e), e)
         return data
 
-    def delete_table(self, table_name):
+    async def delete_table(self, table_name):
         """
         Performs the DeleteTable operation
         """
@@ -587,12 +489,12 @@ class Connection(object):
             TABLE_NAME: table_name
         }
         try:
-            data = self.dispatch(DELETE_TABLE, operation_kwargs)
+            data = await self.dispatch(DELETE_TABLE, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise TableError("Failed to delete table: {0}".format(e), e)
         return data
 
-    def update_table(self,
+    async def update_table(self,
                      table_name,
                      read_capacity_units=None,
                      write_capacity_units=None,
@@ -624,11 +526,11 @@ class Connection(object):
                 })
             operation_kwargs[GLOBAL_SECONDARY_INDEX_UPDATES] = global_secondary_indexes_list
         try:
-            return self.dispatch(UPDATE_TABLE, operation_kwargs)
+            return await self.dispatch(UPDATE_TABLE, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise TableError("Failed to update table: {0}".format(e), e)
 
-    def list_tables(self, exclusive_start_table_name=None, limit=None):
+    async def list_tables(self, exclusive_start_table_name=None, limit=None):
         """
         Performs the ListTables operation
         """
@@ -642,16 +544,16 @@ class Connection(object):
                 LIMIT: limit
             })
         try:
-            return self.dispatch(LIST_TABLES, operation_kwargs)
+            return await self.dispatch(LIST_TABLES, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise TableError("Unable to list tables: {0}".format(e), e)
 
-    def describe_table(self, table_name):
+    async def describe_table(self, table_name):
         """
         Performs the DescribeTable operation
         """
         try:
-            tbl = self.get_meta_table(table_name, refresh=True)
+            tbl = await self.get_meta_table(table_name, refresh=True)
             if tbl:
                 return tbl.data
         except ValueError:
@@ -675,45 +577,17 @@ class Connection(object):
             CONDITIONAL_OPERATOR: operator
         }
 
-    def get_item_attribute_map(self, table_name, attributes, item_key=ITEM, pythonic_key=True):
+    async def get_item_attribute_map(self, table_name, attributes, item_key=ITEM, pythonic_key=True):
         """
         Builds up a dynamodb compatible AttributeValue map
         """
-        tbl = self.get_meta_table(table_name)
+        tbl = await self.get_meta_table(table_name)
         if tbl is None:
             raise TableError("No such table {0}".format(table_name))
         return tbl.get_item_attribute_map(
             attributes,
             item_key=item_key,
             pythonic_key=pythonic_key)
-
-    def get_expected_map(self, table_name, expected):
-        """
-        Builds the expected map that is common to several operations
-        """
-        kwargs = {EXPECTED: {}}
-        for key, condition in expected.items():
-            if EXISTS in condition:
-                kwargs[EXPECTED][key] = {
-                    EXISTS: condition.get(EXISTS)
-                }
-            elif VALUE in condition:
-                kwargs[EXPECTED][key] = {
-                    VALUE: {
-                        self.get_attribute_type(table_name, key): condition.get(VALUE)
-                    }
-                }
-            elif COMPARISON_OPERATOR in condition:
-                kwargs[EXPECTED][key] = {
-                    COMPARISON_OPERATOR: condition.get(COMPARISON_OPERATOR),
-                }
-                values = []
-                for value in condition.get(ATTR_VALUE_LIST, []):
-                    attr_type = self.get_attribute_type(table_name, key, value)
-                    values.append({attr_type: self.parse_attribute(value)})
-                if condition.get(COMPARISON_OPERATOR) not in [NULL, NOT_NULL]:
-                    kwargs[EXPECTED][key][ATTR_VALUE_LIST] = values
-        return kwargs
 
     def parse_attribute(self, attribute, return_type=False):
         """
@@ -733,26 +607,26 @@ class Connection(object):
                 return None, attribute
             return attribute
 
-    def get_attribute_type(self, table_name, attribute_name, value=None):
+    async def get_attribute_type(self, table_name, attribute_name, value=None):
         """
         Returns the proper attribute type for a given attribute name
         :param value: The attribute value an be supplied just in case the type is already included
         """
-        tbl = self.get_meta_table(table_name)
+        tbl = await self.get_meta_table(table_name)
         if tbl is None:
             raise TableError("No such table {0}".format(table_name))
         return tbl.get_attribute_type(attribute_name, value=value)
 
-    def get_identifier_map(self, table_name, hash_key, range_key=None, key=KEY):
+    async def get_identifier_map(self, table_name, hash_key, range_key=None, key=KEY):
         """
         Builds the identifier map that is common to several operations
         """
-        tbl = self.get_meta_table(table_name)
+        tbl = await self.get_meta_table(table_name)
         if tbl is None:
             raise TableError("No such table {0}".format(table_name))
         return tbl.get_identifier_map(hash_key, range_key=range_key, key=key)
 
-    def get_query_filter_map(self, table_name, query_filters):
+    async def get_query_filter_map(self, table_name, query_filters):
         """
         Builds the QueryFilter object needed for the Query operation
         """
@@ -766,7 +640,7 @@ class Connection(object):
             attr_value_list = []
             for value in condition.get(ATTR_VALUE_LIST, []):
                 attr_value_list.append({
-                    self.get_attribute_type(table_name, key, value): self.parse_attribute(value)
+                    (await self.get_attribute_type(table_name, key, value)): self.parse_attribute(value)
                 })
             kwargs[QUERY_FILTER][key] = {
                 COMPARISON_OPERATOR: operator
@@ -805,16 +679,16 @@ class Connection(object):
             RETURN_ITEM_COLL_METRICS: str(return_item_collection_metrics).upper()
         }
 
-    def get_exclusive_start_key_map(self, table_name, exclusive_start_key):
+    async def get_exclusive_start_key_map(self, table_name, exclusive_start_key):
         """
         Builds the exclusive start key attribute map
         """
-        tbl = self.get_meta_table(table_name)
+        tbl = await self.get_meta_table(table_name)
         if tbl is None:
             raise TableError("No such table {0}".format(table_name))
         return tbl.get_exclusive_start_key_map(exclusive_start_key)
 
-    def delete_item(self,
+    async def delete_item(self,
                     table_name,
                     hash_key,
                     range_key=None,
@@ -830,7 +704,7 @@ class Connection(object):
         self._check_condition('condition', condition, expected, conditional_operator)
 
         operation_kwargs = {TABLE_NAME: table_name}
-        operation_kwargs.update(self.get_identifier_map(table_name, hash_key, range_key))
+        operation_kwargs.update((await self.get_identifier_map(table_name, hash_key, range_key)))
         name_placeholders = {}
         expression_attribute_values = {}
 
@@ -855,11 +729,11 @@ class Connection(object):
             operation_kwargs[EXPRESSION_ATTRIBUTE_VALUES] = expression_attribute_values
 
         try:
-            return self.dispatch(DELETE_ITEM, operation_kwargs)
+            return await self.dispatch(DELETE_ITEM, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise DeleteError("Failed to delete item: {0}".format(e), e)
 
-    def update_item(self,
+    async def update_item(self,
                     table_name,
                     hash_key,
                     range_key=None,
@@ -878,7 +752,7 @@ class Connection(object):
         self._check_condition('condition', condition, expected, conditional_operator)
 
         operation_kwargs = {TABLE_NAME: table_name}
-        operation_kwargs.update(self.get_identifier_map(table_name, hash_key, range_key))
+        operation_kwargs.update((await self.get_identifier_map(table_name, hash_key, range_key)))
         name_placeholders = {}
         expression_attribute_values = {}
 
@@ -907,7 +781,7 @@ class Connection(object):
             value = update.get(VALUE)
             attr_type, value = self.parse_attribute(value, return_type=True)
             if attr_type is None and action != DELETE:
-                attr_type = self.get_attribute_type(table_name, key, value)
+                attr_type = await self.get_attribute_type(table_name, key, value)
             value = {attr_type: value}
             if action == DELETE:
                 action = path.remove() if attr_type is None else path.delete(value)
@@ -930,11 +804,11 @@ class Connection(object):
             operation_kwargs[EXPRESSION_ATTRIBUTE_VALUES] = expression_attribute_values
 
         try:
-            return self.dispatch(UPDATE_ITEM, operation_kwargs)
+            return await self.dispatch(UPDATE_ITEM, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise UpdateError("Failed to update item: {0}".format(e), e)
 
-    def put_item(self,
+    async def put_item(self,
                  table_name,
                  hash_key,
                  range_key=None,
@@ -951,12 +825,12 @@ class Connection(object):
         self._check_condition('condition', condition, expected, conditional_operator)
 
         operation_kwargs = {TABLE_NAME: table_name}
-        operation_kwargs.update(self.get_identifier_map(table_name, hash_key, range_key, key=ITEM))
+        operation_kwargs.update((await self.get_identifier_map(table_name, hash_key, range_key, key=ITEM)))
         name_placeholders = {}
         expression_attribute_values = {}
 
         if attributes:
-            attrs = self.get_item_attribute_map(table_name, attributes)
+            attrs = await self.get_item_attribute_map(table_name, attributes)
             operation_kwargs[ITEM].update(attrs[ITEM])
         if condition is not None:
             condition_expression = condition.serialize(name_placeholders, expression_attribute_values)
@@ -979,11 +853,11 @@ class Connection(object):
             operation_kwargs[EXPRESSION_ATTRIBUTE_VALUES] = expression_attribute_values
 
         try:
-            return self.dispatch(PUT_ITEM, operation_kwargs)
+            return await self.dispatch(PUT_ITEM, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise PutError("Failed to put item: {0}".format(e), e)
 
-    def batch_write_item(self,
+    async def batch_write_item(self,
                          table_name,
                          put_items=None,
                          delete_items=None,
@@ -1017,11 +891,11 @@ class Connection(object):
                 })
         operation_kwargs[REQUEST_ITEMS][table_name] = delete_items_list + put_items_list
         try:
-            return self.dispatch(BATCH_WRITE_ITEM, operation_kwargs)
+            return await self.dispatch(BATCH_WRITE_ITEM, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise PutError("Failed to batch write items: {0}".format(e), e)
 
-    def batch_get_item(self,
+    async def batch_get_item(self,
                        table_name,
                        keys,
                        consistent_read=None,
@@ -1056,11 +930,11 @@ class Connection(object):
             )
         operation_kwargs[REQUEST_ITEMS][table_name].update(keys_map)
         try:
-            return self.dispatch(BATCH_GET_ITEM, operation_kwargs)
+            return await self.dispatch(BATCH_GET_ITEM, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise GetError("Failed to batch get items: {0}".format(e), e)
 
-    def get_item(self,
+    async def get_item(self,
                  table_name,
                  hash_key,
                  range_key=None,
@@ -1078,9 +952,9 @@ class Connection(object):
             operation_kwargs[EXPRESSION_ATTRIBUTE_NAMES] = self._reverse_dict(name_placeholders)
         operation_kwargs[CONSISTENT_READ] = consistent_read
         operation_kwargs[TABLE_NAME] = table_name
-        operation_kwargs.update(self.get_identifier_map(table_name, hash_key, range_key))
+        operation_kwargs.update((await self.get_identifier_map(table_name, hash_key, range_key)))
         try:
-            return self.dispatch(GET_ITEM, operation_kwargs)
+            return await self.dispatch(GET_ITEM, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise GetError("Failed to get item: {0}".format(e), e)
 
@@ -1236,7 +1110,7 @@ class Connection(object):
                 # Reset the latest_scan_consumed_capacity, as no scan operation was performed.
                 latest_scan_consumed_capacity = 0
 
-    def scan(self,
+    async def scan(self,
              table_name,
              filter_condition=None,
              attributes_to_get=None,
@@ -1289,11 +1163,11 @@ class Connection(object):
             operation_kwargs[EXPRESSION_ATTRIBUTE_VALUES] = expression_attribute_values
 
         try:
-            return self.dispatch(SCAN, operation_kwargs)
+            return await self.dispatch(SCAN, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise ScanError("Failed to scan table: {0}".format(e), e)
 
-    def query(self,
+    async def query(self,
               table_name,
               hash_key,
               range_key_condition=None,
@@ -1319,7 +1193,7 @@ class Connection(object):
         name_placeholders = {}
         expression_attribute_values = {}
 
-        tbl = self.get_meta_table(table_name)
+        tbl = await self.get_meta_table(table_name)
         if tbl is None:
             raise TableError("No such table: {0}".format(table_name))
         if index_name:
@@ -1331,7 +1205,7 @@ class Connection(object):
             hash_keyname = tbl.hash_keyname
             range_keyname = tbl.range_keyname
 
-        key_condition = self._get_condition(table_name, hash_keyname, '__eq__', hash_key)
+        key_condition = await self._get_condition(table_name, hash_keyname, '__eq__', hash_key)
         if range_key_condition is not None:
             if range_key_condition.is_valid_range_key_condition(range_keyname):
                 key_condition = key_condition & range_key_condition
@@ -1352,7 +1226,7 @@ class Connection(object):
                 raise ValueError("{0} must be one of {1}".format(COMPARISON_OPERATOR, COMPARISON_OPERATOR_VALUES))
             operator = KEY_CONDITION_OPERATOR_MAP[operator]
             values = condition.get(ATTR_VALUE_LIST)
-            sort_key_expression = self._get_condition(table_name, key, operator, *values)
+            sort_key_expression = await self._get_condition(table_name, key, operator, *values)
             key_condition = key_condition & sort_key_expression
 
         operation_kwargs[KEY_CONDITION_EXPRESSION] = key_condition.serialize(
@@ -1384,7 +1258,7 @@ class Connection(object):
         # We read the conditional operator even without a query filter passed in to maintain existing behavior.
         conditional_operator = self.get_conditional_operator(conditional_operator or AND)
         if query_filters:
-            filter_expression = self._get_filter_expression(
+            filter_expression = await self._get_filter_expression(
                 table_name, query_filters, conditional_operator, name_placeholders, expression_attribute_values)
             operation_kwargs[FILTER_EXPRESSION] = filter_expression
         if select:
@@ -1399,11 +1273,11 @@ class Connection(object):
             operation_kwargs[EXPRESSION_ATTRIBUTE_VALUES] = expression_attribute_values
 
         try:
-            return self.dispatch(QUERY, operation_kwargs)
+            return await self.dispatch(QUERY, operation_kwargs)
         except BOTOCORE_EXCEPTIONS as e:
             raise QueryError("Failed to query items: {0}".format(e), e)
 
-    def _get_condition_expression(self, table_name, expected, conditional_operator,
+    async def _get_condition_expression(self, table_name, expected, conditional_operator,
                                   name_placeholders, expression_attribute_values):
         """
         Builds the ConditionExpression needed for DeleteItem, PutItem, and UpdateItem operations
@@ -1426,7 +1300,7 @@ class Connection(object):
                 raise ValueError("{0} must be one of {1}".format(COMPARISON_OPERATOR, QUERY_FILTER_VALUES))
             not_contains = operator == NOT_CONTAINS
             operator = FILTER_EXPRESSION_OPERATOR_MAP[operator]
-            condition = self._get_condition(table_name, key, operator, *values)
+            condition = await self._get_condition(table_name, key, operator, *values)
             if not_contains:
                 condition = ~condition
             if condition_expression is None:
@@ -1437,7 +1311,7 @@ class Connection(object):
                 condition_expression = condition_expression | condition
         return condition_expression.serialize(name_placeholders, expression_attribute_values)
 
-    def _get_filter_expression(self, table_name, filters, conditional_operator,
+    async def _get_filter_expression(self, table_name, filters, conditional_operator,
                                name_placeholders, expression_attribute_values):
         """
         Builds the FilterExpression needed for Query and Scan operations
@@ -1453,7 +1327,7 @@ class Connection(object):
             not_contains = operator == NOT_CONTAINS
             operator = FILTER_EXPRESSION_OPERATOR_MAP[operator]
             values = condition.get(ATTR_VALUE_LIST, [])
-            condition = self._get_condition(table_name, key, operator, *values)
+            condition = await self._get_condition(table_name, key, operator, *values)
             if not_contains:
                 condition = ~condition
             if condition_expression is None:
@@ -1464,9 +1338,9 @@ class Connection(object):
                 condition_expression = condition_expression | condition
         return condition_expression.serialize(name_placeholders, expression_attribute_values)
 
-    def _get_condition(self, table_name, attribute_name, operator, *values):
+    async def _get_condition(self, table_name, attribute_name, operator, *values):
         values = [
-            {self.get_attribute_type(table_name, attribute_name, value): self.parse_attribute(value)}
+            {(await self.get_attribute_type(table_name, attribute_name, value)): self.parse_attribute(value)}
             for value in values
         ]
         return getattr(Path([attribute_name]), operator)(*values)
@@ -1493,6 +1367,117 @@ class Connection(object):
     def _reverse_dict(d):
         return dict((v, k) for k, v in six.iteritems(d))
 
+    async def session_async(self):
+        if not self._async_session:
+            loop = asyncio.get_event_loop()
+            connector = aiobotocore.endpoint.WrappedTCPConnector(
+                loop=loop,
+                wrapped_conn_timeout=None,
+                #limit=max_pool_connections,
+                #verify_ssl=self.verify,
+                #**connector_args,
+                keepalive_timeout=12,
+            )
+
+            self._async_session = aiohttp.ClientSession(
+                connector=connector,
+                read_timeout=None,
+                conn_timeout=None,
+                skip_auto_headers={'CONTENT-TYPE'},
+                response_class=aiobotocore.endpoint.ClientResponseProxy,
+                loop=loop,
+                auto_decompress=False
+            )
+        return self._async_session
+
+    async def client_async(self):
+        if not self._async_client or (self._async_client._request_signer and not self._async_client._request_signer._credentials):
+            session = aiobotocore.get_session(loop=asyncio.get_event_loop())
+            self._async_client = session.create_client(
+                SERVICE_NAME, self.region, endpoint_url=self.host)
+        return self._async_client
+
+    def _maybe_raise_client_error(self, resp_data, resp_status, headers, operation_kwargs):
+        # Copied from https://github.com/garrettheel/PynamoDB/blob/9bfc8e03134c9489a2fa9c2ec8a48b7ce0a73a99/pynamodb/connection/base.py#L377
+        # TODO: consolidate
+        code = resp_data.get('__type', '')
+        if '#' in code:
+            code = code.rsplit('#', 1)[1]
+        botocore_expected_format = {'Error': {'Message': resp_data.get('message', ''), 'Code': code}}
+
+        verbose_properties = {
+            'request_id': headers.get('x-amzn-RequestId')
+        }
+
+        if 'RequestItems' in operation_kwargs:
+            # Batch operations can hit multiple tables, report them comma separated
+            verbose_properties['table_name'] = ','.join(operation_kwargs['RequestItems'])
+        else:
+            verbose_properties['table_name'] = operation_kwargs.get('TableName')
+
+    async def _make_api_call(self, operation_name, operation_kwargs):
+        client = await self.client_async()
+        operation_model = client._service_model.operation_model(operation_name)
+        request_dict = client._convert_to_request_dict(
+            operation_kwargs,
+            operation_model
+        )
+
+        try:
+            resp = await self._make_http_request(request_dict, operation_model)
+            data = await resp.json(content_type=None)
+
+            print(data)
+        except aiohttp.ClientConnectionError:
+            # TODO: retry logic
+            raise
+
+        if resp.status >= 300:
+            self._maybe_raise_client_error(data, resp.status, resp.headers, operation_kwargs)
+
+            # TODO: backoff and such
+
+        return self._handle_binary_attributes(data)
+
+    async def dispatch(self, operation_name, operation_kwargs):
+        if operation_name not in [DESCRIBE_TABLE, LIST_TABLES, UPDATE_TABLE, DELETE_TABLE, CREATE_TABLE]:
+            if RETURN_CONSUMED_CAPACITY not in operation_kwargs:
+                operation_kwargs.update(self.get_consumed_capacity_map(TOTAL))
+        self._log_debug(operation_name, operation_kwargs)
+
+        table_name = operation_kwargs.get(TABLE_NAME)
+        req_uuid = uuid.uuid4()
+
+        self.send_pre_boto_callback(operation_name, req_uuid, table_name)
+        data = await self._make_api_call(operation_name, operation_kwargs)
+        self.send_post_boto_callback(operation_name, req_uuid, table_name)
+
+        if data and CONSUMED_CAPACITY in data:
+            capacity = data.get(CONSUMED_CAPACITY)
+            if isinstance(capacity, dict) and CAPACITY_UNITS in capacity:
+                capacity = capacity.get(CAPACITY_UNITS)
+            log.debug("%s %s consumed %s units",  data.get(TABLE_NAME, ''), operation_name, capacity)
+        return data
+
+    async def _make_http_request(self, request_dict, operation_model):
+        client = await self.client_async()
+        request = client._endpoint.create_request(request_dict, operation_model)
+
+        headers = request.headers
+        # https://github.com/aio-libs/aiobotocore/blob/b24e38ed4767fcbe166701a5f4065ec81666f6e8/aiobotocore/endpoint.py#L263:51
+        headers['Accept-Encoding'] = 'identity'
+        headers_ = MultiDict(
+            (z[0], text_(z[1], encoding='utf-8')) for z in headers.items())
+
+        return await (await self.session_async()).request(
+            request.method,
+            headers=headers_,
+            url=request.url,
+            data=request.body,  # https://github.com/aio-libs/aiobotocore/blob/b24e38ed4767fcbe166701a5f4065ec81666f6e8/aiobotocore/endpoint.py#L271
+            timeout=self._request_timeout_seconds,
+            #proxies=self.client._endpoint.proxies,  # ignore proxy support for now
+        )
+
 
 def _convert_binary(attr):
     if BINARY_SHORT in attr:
@@ -1501,3 +1486,5 @@ def _convert_binary(attr):
         value = attr[BINARY_SET_SHORT]
         if value and len(value):
             attr[BINARY_SET_SHORT] = set(b64decode(v.encode(DEFAULT_ENCODING)) for v in value)
+
+
